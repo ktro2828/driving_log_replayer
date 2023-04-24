@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Dict
 from typing import List
 
-from autoware_auto_perception_msgs.msg import TrafficLight
-from autoware_auto_perception_msgs.msg import TrafficSignal
-from autoware_auto_perception_msgs.msg import TrafficSignalArray
+from autoware_perception_msgs.msg import TrafficLightElement
+from autoware_perception_msgs.msg import TrafficSignal
+from autoware_perception_msgs.msg import TrafficSignalArray
 from driving_log_replayer.node_common import transform_stamped_with_euler_angle
 import driving_log_replayer.perception_eval_conversions as eval_conversions
 from driving_log_replayer.result import PickleWriter
@@ -30,6 +30,7 @@ from driving_log_replayer.result import ResultBase
 from driving_log_replayer.result import ResultWriter
 from geometry_msgs.msg import TransformStamped
 from perception_eval.common.object2d import DynamicObject2D
+from perception_eval.common.status import FrameID
 from perception_eval.config import PerceptionEvaluationConfig
 from perception_eval.evaluation import PerceptionFrameResult
 from perception_eval.evaluation.metrics import MetricsScore
@@ -53,27 +54,22 @@ from tf2_ros import TransformListener
 import yaml
 
 
-def get_label(light: TrafficLight) -> str:
-    if light.color == TrafficLight.RED:
+def get_label(element: TrafficLightElement) -> str:
+    if element.color == TrafficLightElement.RED:
         return "red"
-    elif light.color == TrafficLight.AMBER:
+    elif element.color == TrafficLightElement.AMBER:
         return "yellow"
-    elif light.color == TrafficLight.GREEN:
+    elif element.color == TrafficLightElement.GREEN:
         return "green"
     else:
         return "unknown"
 
 
-def get_most_probable_signal(
-    lights: List[TrafficLight],
-) -> TrafficLight:
-    highest_probability = 0.0
-    highest_light = None
-    for light in lights:
-        if light.confidence >= highest_probability:
-            highest_probability = light.confidence
-            highest_light = light
-    return highest_light
+def get_most_probable_element(
+    elements: List[TrafficLightElement],
+) -> TrafficLightElement:
+    index: int = elements.index(max(elements, key=lambda x: x.confidence))
+    return elements[index]
 
 
 class TrafficLightResult(ResultBase):
@@ -95,9 +91,7 @@ class TrafficLightResult(ResultBase):
             self._success = False
             self._summary = f"Failed: {summary_str}"
 
-    def add_frame(
-        self, frame: PerceptionFrameResult, skip: int, header: Header, map_to_baselink: Dict
-    ):
+    def add_frame(self, frame: PerceptionFrameResult, skip: int, map_to_baselink: Dict):
         self.__total += 1
         has_objects = True
         # OptionalでNoneが入る場合と、空配列の場合の2種類ありそうなので、is None判定ではなくnotで判定する
@@ -189,6 +183,9 @@ class TrafficLightEvaluator(Node):
 
             self.__camera_type = p_cfg["camera_type"]
 
+            # ==== TODO ====
+            self.__use_regulatory_element: bool = True
+
             evaluation_config: PerceptionEvaluationConfig = PerceptionEvaluationConfig(
                 dataset_paths=self.__t4_dataset_paths,
                 frame_id=self.__camera_type,
@@ -221,7 +218,7 @@ class TrafficLightEvaluator(Node):
             self.__evaluator = PerceptionEvaluationManager(evaluation_config=evaluation_config)
             self.__sub_traffic_signals = self.create_subscription(
                 TrafficSignalArray,
-                "/perception/traffic_light_recognition/traffic_signals",
+                "/perception/traffic_light_selector/traffic_signals",
                 self.traffic_signals_cb,
                 1,
             )
@@ -274,19 +271,23 @@ class TrafficLightEvaluator(Node):
         self, unix_time: int, signals: List[TrafficSignal]
     ) -> List[DynamicObject2D]:
         estimated_objects: List[DynamicObject2D] = []
-        for signal in signals:
-            most_probable_light = get_most_probable_signal(signal.lights)
-            label = self.__evaluator.evaluator_config.label_converter.convert_label(
-                label=get_label(most_probable_light)
+        for i, signal in enumerate(signals):
+            element: TrafficLightElement = get_most_probable_element(signal.elements)
+
+            label: str = self.__evaluator.evaluator_config.label_converter.convert_label(
+                get_label(element)
             )
+            logging.info(f"Est ID{[i]}: {signal.traffic_signal_id}")
 
             estimated_object = DynamicObject2D(
                 unix_time=unix_time,
-                frame_id=self.__camera_type,
-                semantic_score=most_probable_light.confidence,
+                frame_id=FrameID.TRAFFIC_LIGHT
+                if self.__use_regulatory_element
+                else self.__camera_type,
+                semantic_score=element.confidence,
                 semantic_label=label,
                 roi=None,
-                uuid=str(signal.map_primitive_id),
+                uuid=str(signal.traffic_signal_id),
             )
             estimated_objects.append(estimated_object)
         return estimated_objects
@@ -294,12 +295,12 @@ class TrafficLightEvaluator(Node):
     def traffic_signals_cb(self, msg: TrafficSignalArray):
         try:
             map_to_baselink = self.__tf_buffer.lookup_transform(
-                "map", "base_link", msg.header.stamp, Duration(seconds=0.5)
+                "map", "base_link", msg.stamp, Duration(seconds=0.5)
             )
         except TransformException as ex:
             self.get_logger().info(f"Could not transform map to baselink: {ex}")
             map_to_baselink = TransformStamped()
-        unix_time: int = eval_conversions.unix_time_from_ros_msg(msg.header)
+        unix_time: int = eval_conversions.unix_time_from_ros_timestamp(msg.stamp)
         # 現frameに対応するGround truthを取得
         ground_truth_now_frame = self.__evaluator.get_ground_truth_now_frame(unix_time)
         if ground_truth_now_frame is None:
@@ -308,9 +309,12 @@ class TrafficLightEvaluator(Node):
             # self.get_logger().error(
             #     f"debug: get ground truth: {self.__current_time.sec}.{self.__current_time.nanosec}"
             # )
+            logging.info("==============start conversion==============")
             estimated_objects: List[DynamicObject2D] = self.list_dynamic_object_2d_from_ros_msg(
                 unix_time, msg.signals
             )
+            logging.info(f"GT IDs: {[obj.uuid for obj in ground_truth_now_frame.objects]}")
+            logging.info("==============end conversion==============")
             # self.get_logger().error(
             #     f"debug: get dynamic object 2d: {self.__current_time.sec}.{self.__current_time.nanosec}"
             # )
@@ -333,7 +337,6 @@ class TrafficLightEvaluator(Node):
             self.__result.add_frame(
                 frame_result,
                 self.__skip_counter,
-                msg.header,
                 transform_stamped_with_euler_angle(map_to_baselink),
             )
             self.__result_writer.write(self.__result)

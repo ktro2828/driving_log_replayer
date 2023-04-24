@@ -28,6 +28,7 @@ from pyquaternion.quaternion import Quaternion
 from rclpy.time import Duration
 from std_msgs.msg import ColorRGBA
 from std_msgs.msg import Header
+from builtin_interfaces.msg import Time
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
@@ -35,6 +36,8 @@ from visualization_msgs.msg import MarkerArray
 def unix_time_from_ros_msg(ros_header: Header) -> int:
     return ros_header.stamp.sec * pow(10, 6) + ros_header.stamp.nanosec // 1000
 
+def unix_time_from_ros_timestamp(ros_timestamp: Time) -> int:
+    return ros_timestamp.sec * pow(10, 6) + ros_timestamp.nanosec // 1000
 
 def position_from_ros_msg(ros_position: Point) -> Tuple[int, int, int]:
     return (ros_position.x, ros_position.y, ros_position.z)
