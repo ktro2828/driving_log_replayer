@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Dict
 from typing import List
+import json
 
 from autoware_perception_msgs.msg import TrafficLightElement
 from autoware_perception_msgs.msg import TrafficSignal
@@ -55,14 +56,29 @@ import yaml
 
 
 def get_label(element: TrafficLightElement) -> str:
+    label = ""
     if element.color == TrafficLightElement.RED:
-        return "red"
+        label += "red"
     elif element.color == TrafficLightElement.AMBER:
-        return "yellow"
+        label += "yellow"
     elif element.color == TrafficLightElement.GREEN:
-        return "green"
+        label += "green"
     else:
         return "unknown"
+
+    if element.shape == TrafficLightElement.CIRCLE:
+        return label
+    elif element.shape == TrafficLightElement.LEFT_ARROW:
+        label += "_left"
+    elif element.shape == TrafficLightElement.RIGHT_ARROW:
+        label += "_right"
+    elif element.shape == TrafficLightElement.UP_ARROW:
+        label += "_straight"
+    # elif element.shape == TrafficLightElement.UP_LEFT_ARROW:
+    #     label += "_straight_left"
+    # elif element.shape == TrafficLightElement.UP_RIGHT_ARROW:
+    #     label += "_straight_right"
+    return label
 
 
 def get_most_probable_element(
@@ -70,6 +86,30 @@ def get_most_probable_element(
 ) -> TrafficLightElement:
     index: int = elements.index(max(elements, key=lambda x: x.confidence))
     return elements[index]
+
+
+class FailResultHolder:
+    def __init__(self, save_dir: str) -> None:
+        self.save_path: str = os.path.join(save_dir, "fail_info.json")
+        self.buffer = []
+
+    def add_frame(self, frame_result: PerceptionFrameResult) -> None:
+        if 0 < frame_result.pass_fail_result.get_fail_object_num():
+            info = {"fp": [], "fn": []}
+            info["timestamp"] = frame_result.frame_ground_truth.unix_time
+            for fp_result in frame_result.pass_fail_result.fp_object_results:
+                est_label = fp_result.estimated_object.semantic_label.label.value
+                gt_label = fp_result.ground_truth_object.semantic_label.label.value if fp_result.ground_truth_object is not None else None
+                info["fp"].append({"est": est_label, "gt": gt_label})
+            for fn_object in frame_result.pass_fail_result.fn_objects:
+                info["fn"].append({"est": None, "gt": fn_object.semantic_label.label.value})
+
+            logging.info(f"Fail timestamp: {info}")
+            self.buffer.append(info)
+
+    def save(self) -> None:
+        with open(self.save_path, "w") as f:
+            json.dump(self.buffer, f, ensure_ascii=False, indent=4)
 
 
 class TrafficLightResult(ResultBase):
@@ -185,6 +225,7 @@ class TrafficLightEvaluator(Node):
 
             # ==== TODO ====
             self.__use_regulatory_element: bool = True
+            self.fail_result_holder = FailResultHolder(self.__perception_eval_log_path)
 
             evaluation_config: PerceptionEvaluationConfig = PerceptionEvaluationConfig(
                 dataset_paths=self.__t4_dataset_paths,
@@ -263,6 +304,7 @@ class TrafficLightEvaluator(Node):
                     conf_mat_dict = conf_mat_df.to_dict()
                 final_metrics = {"Score": score_dict, "ConfusionMatrix": conf_mat_dict}
                 self.__result.add_final_metrics(final_metrics)
+                self.fail_result_holder.save()
                 self.__result_writer.write(self.__result)
                 self.__result_writer.close()
                 rclpy.shutdown()
@@ -274,10 +316,10 @@ class TrafficLightEvaluator(Node):
         for i, signal in enumerate(signals):
             element: TrafficLightElement = get_most_probable_element(signal.elements)
 
-            label: str = self.__evaluator.evaluator_config.label_converter.convert_label(
+            label = self.__evaluator.evaluator_config.label_converter.convert_label(
                 get_label(element)
             )
-            logging.info(f"Est ID{[i]}: {signal.traffic_signal_id}")
+            logging.info(f"Est {[i]}: {(signal.traffic_signal_id, label.name)}")
 
             estimated_object = DynamicObject2D(
                 unix_time=unix_time,
@@ -313,7 +355,7 @@ class TrafficLightEvaluator(Node):
             estimated_objects: List[DynamicObject2D] = self.list_dynamic_object_2d_from_ros_msg(
                 unix_time, msg.signals
             )
-            logging.info(f"GT IDs: {[obj.uuid for obj in ground_truth_now_frame.objects]}")
+            logging.info(f"GTs: {[(obj.uuid, obj.semantic_label.name)for obj in ground_truth_now_frame.objects]}")
             logging.info("==============end conversion==============")
             # self.get_logger().error(
             #     f"debug: get dynamic object 2d: {self.__current_time.sec}.{self.__current_time.nanosec}"
@@ -334,11 +376,13 @@ class TrafficLightEvaluator(Node):
             #     f"debug: get frame result: {self.__current_time.sec}.{self.__current_time.nanosec}"
             # )
             # write result
+            logging.info(f"TP: {len(frame_result.pass_fail_result.tp_object_results)}, FP: {len(frame_result.pass_fail_result.fp_object_results)}, FN: {len(frame_result.pass_fail_result.fn_objects)}")
             self.__result.add_frame(
                 frame_result,
                 self.__skip_counter,
                 transform_stamped_with_euler_angle(map_to_baselink),
             )
+            self.fail_result_holder.add_frame(frame_result)
             self.__result_writer.write(self.__result)
 
     def get_final_result(self) -> MetricsScore:
