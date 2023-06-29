@@ -14,12 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Dict
 from typing import List
-import json
+from typing import Set
+from typing import Tuple
 
 from autoware_perception_msgs.msg import TrafficLightElement
 from autoware_perception_msgs.msg import TrafficSignal
@@ -54,31 +56,62 @@ from tf2_ros import TransformException
 from tf2_ros import TransformListener
 import yaml
 
+LABEL_MAPPINGS: List[Tuple[Set, str]] = [
+    ({"green"}, "green"),
+    ({"green", "straight"}, "green_straight"),
+    ({"green", "left"}, "green_left"),
+    ({"green", "right"}, "green_right"),
+    ({"yellow"}, "yellow"),
+    ({"yellow", "straight"}, "yellow_straight"),
+    ({"yellow", "left"}, "yellow_left"),
+    ({"yellow", "right"}, "yellow_right"),
+    ({"yellow", "straight", "left"}, "yellow_straight_left"),
+    ({"yellow", "straight", "right"}, "yellow_straight_right"),
+    ({"red"}, "red"),
+    ({"red", "straight"}, "red_straight"),
+    ({"red", "left"}, "red_left"),
+    ({"red", "right"}, "red_right"),
+    ({"red", "straight", "left"}, "red_straight_left"),
+    ({"red", "straight", "right"}, "red_straight_right"),
+    ({"red", "straight", "left", "right"}, "red_straight_left_right"),
+    ({"red", "right", "diagonal"}, "red_rightdiagonal"),
+    ({"red", "left", "diagonal"}, "red_leftdiagonal"),
+]
 
-def get_label(element: TrafficLightElement) -> str:
-    label = ""
-    if element.color == TrafficLightElement.RED:
-        label += "red"
-    elif element.color == TrafficLightElement.AMBER:
-        label += "yellow"
-    elif element.color == TrafficLightElement.GREEN:
-        label += "green"
-    else:
-        return "unknown"
 
-    if element.shape == TrafficLightElement.CIRCLE:
-        return label
-    elif element.shape == TrafficLightElement.LEFT_ARROW:
-        label += "_left"
-    elif element.shape == TrafficLightElement.RIGHT_ARROW:
-        label += "_right"
-    elif element.shape == TrafficLightElement.UP_ARROW:
-        label += "_straight"
-    # elif element.shape == TrafficLightElement.UP_LEFT_ARROW:
-    #     label += "_straight_left"
-    # elif element.shape == TrafficLightElement.UP_RIGHT_ARROW:
-    #     label += "_straight_right"
-    return label
+def get_label(elements: List[TrafficLightElement]) -> str:
+    global LABEL_MAPPINGS
+    label_infos = []
+    for element in elements:
+        if element.shape == TrafficLightElement.CIRCLE:
+            if element.color == TrafficLightElement.RED:
+                label_infos.append("red")
+            elif element.color == TrafficLightElement.AMBER:
+                label_infos.append("yellow")
+            elif element.color == TrafficLightElement.GREEN:
+                label_infos.append("green")
+            continue
+
+        if element.shape == TrafficLightElement.UP_ARROW:
+            label_infos.append("straight")
+        elif element.shape == TrafficLightElement.LEFT_ARROW:
+            label_infos.append("left")
+        elif element.shape == TrafficLightElement.RIGHT_ARROW:
+            label_infos.append("right")
+        elif element.shape in (TrafficLightElement.UP_LEFT, TrafficLightElement.DOWN_LEFT):
+            label_infos.append("left")
+            label_infos.append("diagonal")
+        elif element.shape in (TrafficLightElement.UP_RIGHT, TrafficLightElement.DOWN_RIGHT):
+            label_infos.append("right")
+            label_infos.append("diagonal")
+
+    label_infos = set(label_infos)
+
+    for info_set, label in LABEL_MAPPINGS:
+        if label_infos == info_set:
+            return label
+
+    return "unknown"
 
 
 def get_most_probable_element(
@@ -99,7 +132,11 @@ class FailResultHolder:
             info["timestamp"] = frame_result.frame_ground_truth.unix_time
             for fp_result in frame_result.pass_fail_result.fp_object_results:
                 est_label = fp_result.estimated_object.semantic_label.label.value
-                gt_label = fp_result.ground_truth_object.semantic_label.label.value if fp_result.ground_truth_object is not None else None
+                gt_label = (
+                    fp_result.ground_truth_object.semantic_label.label.value
+                    if fp_result.ground_truth_object is not None
+                    else None
+                )
                 info["fp"].append({"est": est_label, "gt": gt_label})
             for fn_object in frame_result.pass_fail_result.fn_objects:
                 info["fn"].append({"est": None, "gt": fn_object.semantic_label.label.value})
@@ -314,11 +351,10 @@ class TrafficLightEvaluator(Node):
     ) -> List[DynamicObject2D]:
         estimated_objects: List[DynamicObject2D] = []
         for i, signal in enumerate(signals):
-            element: TrafficLightElement = get_most_probable_element(signal.elements)
-
             label = self.__evaluator.evaluator_config.label_converter.convert_label(
-                get_label(element)
+                get_label(signal.elements)
             )
+            confidence: float = max(signal.elements, key=lambda x: x.confidence)
             logging.info(f"Est {[i]}: {(signal.traffic_signal_id, label.name)}")
 
             estimated_object = DynamicObject2D(
@@ -326,7 +362,7 @@ class TrafficLightEvaluator(Node):
                 frame_id=FrameID.TRAFFIC_LIGHT
                 if self.__use_regulatory_element
                 else self.__camera_type,
-                semantic_score=element.confidence,
+                semantic_score=confidence,
                 semantic_label=label,
                 roi=None,
                 uuid=str(signal.traffic_signal_id),
@@ -355,7 +391,9 @@ class TrafficLightEvaluator(Node):
             estimated_objects: List[DynamicObject2D] = self.list_dynamic_object_2d_from_ros_msg(
                 unix_time, msg.signals
             )
-            logging.info(f"GTs: {[(obj.uuid, obj.semantic_label.name)for obj in ground_truth_now_frame.objects]}")
+            logging.info(
+                f"GTs: {[(obj.uuid, obj.semantic_label.name)for obj in ground_truth_now_frame.objects]}"
+            )
             logging.info("==============end conversion==============")
             # self.get_logger().error(
             #     f"debug: get dynamic object 2d: {self.__current_time.sec}.{self.__current_time.nanosec}"
@@ -376,7 +414,9 @@ class TrafficLightEvaluator(Node):
             #     f"debug: get frame result: {self.__current_time.sec}.{self.__current_time.nanosec}"
             # )
             # write result
-            logging.info(f"TP: {len(frame_result.pass_fail_result.tp_object_results)}, FP: {len(frame_result.pass_fail_result.fp_object_results)}, FN: {len(frame_result.pass_fail_result.fn_objects)}")
+            logging.info(
+                f"TP: {len(frame_result.pass_fail_result.tp_object_results)}, FP: {len(frame_result.pass_fail_result.fp_object_results)}, FN: {len(frame_result.pass_fail_result.fn_objects)}"
+            )
             self.__result.add_frame(
                 frame_result,
                 self.__skip_counter,
